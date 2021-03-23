@@ -1949,6 +1949,7 @@ F:	package/libgit2/
 N:	Nicolas Serafini <nicolas.serafini@ik.me>
 F:	package/exiv2/
 F:	package/ofono/
+F:	utils/scanros
 
 N:	Nikolay Dimitrov <nikolay.dimitrov@retrohub.org>
 F:	board/embest/riotboard/

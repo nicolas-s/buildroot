@@ -1,0 +1,582 @@
+#!/usr/bin/env python3
+"""
+
+Utility for building Buildroot packages for existing ROS packages
+
+Any package built by rospkggen should be manually checked for errors.
+"""
+import os
+import argparse
+import logging
+import requests
+import shutil
+import urllib
+import hashlib
+import textwrap
+import yaml
+import re
+import catkin_pkg.package
+from collections import OrderedDict
+from colorama import Fore
+import spdx_lookup as spdx
+
+COLORS = {
+    logging.DEBUG: Fore.BLUE,
+    logging.INFO: Fore.GREEN,
+    logging.WARNING: Fore.YELLOW,
+    logging.CRITICAL: Fore.RED,
+    logging.ERROR: Fore.RED
+}
+
+
+class ColoredFormatter(logging.Formatter):
+
+    def __init__(self):
+        super().__init__('%(message)s')
+
+    def format(self, record: logging.LogRecord) -> str:
+        return f'{COLORS[record.levelno]}{super().format(record)}{Fore.RESET}'
+
+
+def github_raw_url(repo_url, path, commitish):
+    """
+    Returns the URL of the file blob corresponding to `path` in the
+    github repository `repo_url` in branch, commit or tag `commitish`.
+    """
+    url = urllib.parse.urlparse(repo_url)
+    return f"{url.scheme}://raw.{url.netloc}{url.path.replace('.git', '')}/{commitish}/{path}"
+
+
+def gitlab_raw_url(repo_url, path, commitish):
+    """
+    Returns the URL of the file blob corresponding to `path` in the
+    gitlab repository `repo_url` in branch, commit or tag `commitish`.
+    """
+    url = urllib.parse.urlparse(repo_url)
+    return f"{url.scheme}://{url.netloc}{url.path.replace('.git', '')}/-/raw/{commitish}/{path}"
+
+
+def repo_raw_url(repo_url, distroname, pkgname, path):
+    # Create raw url
+    if 'github' in repo_url:
+        return github_raw_url(repo_url, path, f'release/{distroname}/{pkgname}')
+    elif 'gitlab' in repo_url:
+        return gitlab_raw_url(repo_url, path, f'release/{distroname}/{pkgname}')
+    else:
+        raise Exception(f'Unable to generate package.xml url for {pkgname} at {repo_url}')
+
+
+def check_package_xml(distroname, repo_url, pkgname):
+    package_xml_url = repo_raw_url(repo_url, distroname, pkgname, 'package.xml')
+
+    # Download and process package.xml file
+    request = requests.get(package_xml_url)
+    if request.status_code != 200:
+        return False
+    return True
+
+
+def rosify_pkg_name(name):
+    return f"ros-{name.replace('_', '-')}"
+
+
+def get_url(url):
+    return re.findall(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\(\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', url)
+
+
+class RosDistribution(object):
+    """
+    ROS distribution yaml parsing
+    """
+    def __init__(self, distro_name, version, distro_yaml, python_version=3):
+        self.name = distro_name
+        self.distro = yaml.safe_load(distro_yaml)
+        self.version = version
+        self.python_version = python_version
+        # clean "metapackages"
+        if 'metapackages' in self.distro['repositories'].keys():
+            metapackages = self.distro['repositories']['metapackages']['release']
+            for meta in metapackages['packages']:
+                self.distro['repositories'][meta] = {}
+                self.distro['repositories'][meta]['release'] = {}
+                self.distro['repositories'][meta]['release']['url'] = metapackages['url']
+                self.distro['repositories'][meta]['release']['version'] = metapackages['version']
+            del self.distro['repositories']['metapackages']
+        if 'catkin' in self.distro['repositories'].keys():
+            del self.distro['repositories']['catkin']
+        if 'catkin_virtualenv' in self.distro['repositories'].keys():
+            del self.distro['repositories']['catkin_virtualenv']
+        self.__package_cache = {}
+        self._packages = [name for name in self.distro['repositories'].keys()]
+        self._expandpackages = sum(
+            [([name] + self.distro['repositories'][name].get('release', {'packages': []}).get('packages', []))
+             for name in self._packages], [])
+        self._expandpackages = list(OrderedDict.fromkeys(self._expandpackages))
+
+    def meta_package_package_names(self, name):
+        return self.distro['repositories'][name]['release']['packages']
+
+    def packages(self, expand=False):
+        """
+        Return a list of packages for the distribution
+
+        Args:
+        expand -- expand metapackages
+        """
+        if expand:
+            return self._expandpackages
+        return self._packages
+
+    def is_package(self, pkgname):
+        return pkgname in self._expandpackages
+
+    def is_meta_package(self, name):
+        if self.distro['repositories'].get(name) is not None:
+            if self.distro['repositories'][name].get('release') is not None:
+                if self.distro['repositories'][name]['release'].get('packages') is not None:
+                    return True
+        return False
+
+    def is_valid_package(self, name):
+        if self.distro['repositories'].get(name):
+            if self.distro['repositories'][name].get('release'):
+                return check_package_xml(self.name, self.distro['repositories'][name]['release']['url'], name)
+        else:
+            for package in self.packages():
+                if (self.is_meta_package(package)
+                        and name in self.distro['repositories'][package]['release']['packages']):
+                    return check_package_xml(self.name, self.distro['repositories'][package]['release']['url'], name)
+        return False
+
+    def __get_package_data(self, name):
+        """
+        Searches for `name` in all known packages and metapackages.
+        """
+        if self.distro['repositories'].get(name):
+            if self.distro['repositories'][name].get('release'):
+                return self.distro['repositories'][name]['release']
+        else:
+            for package in self.packages():
+                if (self.is_meta_package(package)
+                        and name in self.distro['repositories'][package]['release']['packages']):
+                    return self.distro['repositories'][package]['release']
+        return None
+
+    def get_ros_package(self, name):
+        if self.__package_cache.get(name):
+            return self.__package_cache[name]
+        package_data = self.__get_package_data(name)
+        url = package_data['url']
+        version = package_data['version']
+        # WARNING: some metapackages embed a package with the same name. In this case,
+        #          we treat the package as a normal package.
+        package = RosPackage(self, url, name, version)
+        self.__package_cache[name] = package
+        return package
+
+
+class RosPackage(object):
+    """
+    ROS package to generate buildroot files
+    """
+    def __init__(self, rosdistro, repo_url, name, version):
+        self.distro = rosdistro
+        self.buildroot_distro_name = 'ROS_DISTRIBUTION_NAME'
+        self.repo_url = repo_url
+        self.repo_name = self.repo_url.split('/')[-1].split('.')[0]
+        self.version = version
+
+        self.package_xml_url = repo_raw_url(repo_url, self.distro.name, name, 'package.xml')
+
+        # Download and process package.xml file
+        request = requests.get(self.package_xml_url)
+        if request.status_code != 200:
+            raise Exception(f'Unable to download package.xml file at {self.package_xml_url}')
+        self.package_xml = request.text
+        self.package = catkin_pkg.package.parse_package_string(request.text)
+        self.name = self.package.name
+        self.buildroot_name = rosify_pkg_name(self.package.name)
+        self.mk_name = self.buildroot_name.upper().replace('-', '_')
+
+        # Tarball
+        self.targz = f'{self.name}-{self.distro.name}-{self.version}.tar.gz'
+        if 'github' in self.repo_url:
+            self.targz_url = f"{self.repo_url.replace('.git', '')}/archive/release/{self.distro.name}/{self.name}/{self.version}"
+        elif 'gitlab' in self.repo_url:
+            self.targz_url = f"{self.repo_url.replace('.git', '')}/-/archive/release/{self.distro.name}/{self.name}/{self.version}"
+        else:
+            raise Exception(f'Unable to generate tarball url for package {name} with url {self.repository_url}')
+
+        dep_cond = {
+            'ROS_DISTRO': self.distro.name,
+            'ROS_VERSION': self.distro.version,
+            'ROS_PYTHON_VERSION': self.distro.python_version
+        }
+        self.run_dependencies = list(OrderedDict.fromkeys([dependency.name
+                                                           for dependency in self.package.run_depends
+                                                           if dependency.evaluate_condition(dep_cond)]))
+        self.build_dependencies = list(OrderedDict.fromkeys([dependency.name
+                                                             for dependency in self.package.build_depends
+                                                             if dependency.evaluate_condition(dep_cond)]))
+        self.build_dependencies += list(OrderedDict.fromkeys([dependency.name
+                                                              for dependency in self.package.buildtool_depends
+                                                              if dependency.evaluate_condition(dep_cond)]))
+        # Build dependencies already added:
+        if 'git' in self.build_dependencies:
+            self.build_dependencies.remove('git')
+        if 'cmake' in self.build_dependencies:
+            self.build_dependencies.remove('cmake')
+        if 'catkin' in self.build_dependencies:
+            self.build_dependencies.remove('catkin')
+        # Some bad run dependencies are defined into package.xml:
+        if 'git' in self.run_dependencies:
+            self.run_dependencies.remove('git')
+        if 'cmake' in self.run_dependencies:
+            self.run_dependencies.remove('cmake')
+        if 'catkin' in self.run_dependencies:
+            self.run_dependencies.remove('catkin')
+        # rosify ros package name only
+        self.ros_build_dependencies = [dep for dep in self.build_dependencies if dep in self.distro.packages(True)]
+        self.ros_run_dependencies = [dep for dep in self.run_dependencies if dep in self.distro.packages(True)]
+        self.other_build_dependencies = [dep for dep in self.build_dependencies if dep not in self.distro.packages(True)]
+        self.other_run_dependencies = [dep for dep in self.run_dependencies if dep not in self.distro.packages(True)]
+
+        # Remove HTML tags from description
+        self.description = re.sub('<[^<]+?>', '', self.package.description)
+        # Put it on one line to motivate packagers to make shorter descriptions
+        self.description = re.sub('\n', ' ', self.description)
+        # Convert tabs to spaces
+        self.description = re.sub('\t', ' ', self.description)
+        # Multiple consecutive spaces turned into one
+        self.description = re.sub('([ ]+)', ' ', self.description)
+        # Handle quotes
+        self.description = self.description.replace('"', '').replace('`', '').replace('&quot;', '').replace('\'', '')
+
+        # Website URL
+        self.site_url = ""
+        self.repo_url = ""
+        for url in self.package.urls:
+            if url.type == "website":
+                # Some maintainers provide wrong URLs...
+                url.url = get_url(url.url)
+                if url.url:
+                    self.site_url = url.url[0]
+            elif url.type == "repository":
+                # Some maintainers provide wrong URLs...
+                url.url = get_url(url.url)
+                if url.url:
+                    self.repo_url = url.url[0]
+
+    def __create_mk_header(self):
+        """
+        Create the header of the <package_name>.mk file
+        """
+        header = ['#' * 80 + '\n']
+        header.append('#\n')
+        header.append(f'# {self.buildroot_name}\n')
+        header.append('#\n')
+        header.append('#' * 80 + '\n')
+        header.append('\n')
+        return header
+
+    def __create_mk_download_info(self):
+        """
+        Create the lines referring to the download information of the
+        <package_name>.mk file
+        """
+        lines = []
+        version_line = f'{self.mk_name}_VERSION = {self.version}\n'
+        lines.append(version_line)
+
+        buildroot_targz = self.targz.replace(self.version, f'$({self.mk_name}_VERSION)')
+        buildroot_targz = buildroot_targz.replace(self.distro.name, f'$({self.buildroot_distro_name})')
+        targz_line = f'{self.mk_name}_SOURCE = {buildroot_targz}\n'
+        lines.append(targz_line)
+
+        site_url = self.targz_url.replace(self.version, f'$({self.mk_name}_VERSION)')
+        site_url = site_url.replace(self.distro.name, f'$({self.buildroot_distro_name})')
+        site_line = f'{self.mk_name}_SITE = {site_url}'
+        site_line = site_line.rstrip('/') + '\n'
+        lines.append(site_line)
+
+        return lines
+
+    def __create_mk_license(self):
+        """
+        Create the lines referring to the licenses infortmations of the <package_name>.mk file
+        """
+        license_dict = {
+            'BSL1.0': 'BSL-1.0',
+            'Boost Software License, Version 1.0': 'BSL-1.0',
+            'Boost Software License': 'BSL-1.0',
+            'BSD-3': 'BSD-3-Clause',
+            'BSD 3-Clause': 'BSD-3-Clause',
+            'Apache 2.0': 'Apache-2.0',
+            'Apache License 2.0': 'Apache-2.0',
+            'Apache 2': 'Apache-2.0',
+            'Apache2': 'Apache-2.0',
+            'Apache License, Version 2.0': 'Apache-2.0',
+            'Mozilla Public License Version 1.1': 'MPL-1.1',
+            'CreativeCommons-Attribution-NonCommercial-ShareAlike-4.0-International': 'CC-BY-NC-SA-4.0',
+            'CC BY-NC-SA 4.0': 'CC-BY-NC-SA-4.0',
+        }
+        fix_license_dict = {
+            'Apache': 'Apache (FIXME: clarify exact Apache version)',
+            'BSD': 'BSD (FIXME: clarify exact BSD version)',
+            'GPL': 'GPL (FIXME: clarify exact GPL version)',
+            'LGPL': 'LGPL (FIXME: clarify exact LGPL version)',
+            'GNU Lesser General Public License (LGPL)': 'LGPL (FIXME: clarify exact LGPL version)',
+            'GPLv3': 'GPL-3.0 (FIXME: clarify version only or later)',
+            'GPLv2': 'GPL-2.0 (FIXME: clarify version only or later)',
+            'LGPLv3': 'LGPL-3.0 (FIXME: clarify version only or later)',
+            'AGPLv3': 'AGPL-3.0 (FIXME: clarify version only or later)',
+        }
+        lines = []
+        if self.package.licenses:
+            licenses = []
+            unknown_licenses = []
+            for license in self.package.licenses:
+                if spdx.by_id(license) is None:
+                    if license in license_dict:
+                        licenses.append(license_dict[license])
+                        logging.info(f'Package {self.buildroot_name} license was replaced: '
+                                     f'{license} -> {license_dict[license]}')
+                    elif license in fix_license_dict:
+                        unknown_licenses.append(fix_license_dict[license])
+                        logging.warning(f'Package {self.buildroot_name} license need to be fixed: '
+                                        f'{license} -> {fix_license_dict[license]}')
+                    else:
+                        unknown_licenses.append(license)
+                        logging.warning(f'Package {self.buildroot_name} has unknown spdx license: {license}')
+                else:
+                    licenses.append(license)
+            if licenses:
+                license_line = ', '.join(licenses)
+                if unknown_licenses:
+                    license_line += ' #, ' + ', '.join(unknown_licenses)
+                lines.append(f'{self.mk_name}_LICENSE = {license_line}' + '\n')
+            elif unknown_licenses:
+                license_line = ', '.join(unknown_licenses)
+                lines.append(f'# {self.mk_name}_LICENSE = {license_line}' + '\n')
+        else:
+            logging.warning(f"Package {self.buildroot_name} doesn't have license")
+        return lines
+
+    def __create_mk_requirements(self):
+        """
+        Create the requirements lines corresponding to the <package_name>.mk file
+        """
+        lines = []
+        if self.ros_build_dependencies:
+            deps = [rosify_pkg_name(dep) for dep in self.ros_build_dependencies]
+            dependencies_line = ' '.join(deps)
+            if self.other_build_dependencies:
+                dependencies_line += ' # FIXME: ' + ' '.join(self.other_build_dependencies)
+                logging.warning(f"Package {self.buildroot_name} mk need external dependencies: "
+                                f"{' '.join(self.other_build_dependencies)}")
+            lines.append(f"{self.mk_name}_DEPENDENCIES = {dependencies_line}\n")
+        elif self.other_build_dependencies:
+            lines.append(f"# FIXME: {self.mk_name}_DEPENDENCIES = {' '.join(self.other_build_dependencies)}\n")
+            logging.warning(f"Package {self.buildroot_name} mk need external dependencies: "
+                            f"{' '.join(self.other_build_dependencies)}")
+        return lines
+
+    def create_package_mk(self, pkg_dir):
+        """
+        Create the lines corresponding to the <package_name>.mk file
+        """
+        pkg_mk = f'{self.buildroot_name}.mk'
+        path_to_mk = os.path.join(pkg_dir, pkg_mk)
+        logging.info(f'Creating {pkg_mk}...')
+        lines = self.__create_mk_header()
+        lines += self.__create_mk_download_info()
+        lines += self.__create_mk_license()
+        lines += self.__create_mk_requirements()
+
+        lines.append('\n')
+        lines.append('$(eval $(catkin-package))')
+        lines.append('\n')
+        with open(path_to_mk, 'w') as mk_file:
+            mk_file.writelines(lines)
+
+    def create_hash_file(self, pkg_dir, tmp_dir):
+        """
+        Create the lines corresponding to the <package_name>.hash file
+        """
+        pkg_hash = f'{self.buildroot_name}.hash'
+        path_to_hash = os.path.join(pkg_dir, pkg_hash)
+        path_to_targz = os.path.join(tmp_dir, self.targz)
+        logging.info(f'Creating {pkg_hash}...')
+        url = f'{self.targz_url}/{self.targz}'
+        with requests.get(url, stream=True) as r:
+            r.raise_for_status()
+            with open(path_to_targz, 'wb') as f:
+                shutil.copyfileobj(r.raw, f)
+
+        lines = []
+        lines.append('# Locally calculated\n')
+        lines.append((f"sha256  {hashlib.sha256(open(path_to_targz, 'rb').read()).hexdigest()}  {self.targz}\n"))
+        with open(path_to_hash, 'w') as hash_file:
+            hash_file.writelines(lines)
+
+    def create_config_in(self, pkg_dir):
+        """
+        Create the lines corresponding to the Config.in file
+        """
+        path_to_config = os.path.join(pkg_dir, 'Config.in')
+        logging.info(f'\nCreating {self.buildroot_name} Config.in...')
+        lines = []
+        lines.append(f'config BR2_PACKAGE_{self.mk_name}\n')
+        lines.append(f'\tbool "{self.buildroot_name}"\n')
+        ros_deps = list(OrderedDict.fromkeys(self.ros_build_dependencies + self.ros_run_dependencies))
+        if ros_deps:
+            ros_deps.sort()
+            for dep in ros_deps:
+                lines.append(f"\tselect BR2_PACKAGE_{rosify_pkg_name(dep).upper().replace('-', '_')}\n")
+        other_deps = list(OrderedDict.fromkeys(self.other_build_dependencies + self.other_run_dependencies))
+        if other_deps:
+            other_deps.sort()
+            logging.warning(f"Package {self.buildroot_name} Config.in need external dependencies: {' '.join(other_deps)}")
+            for dep in other_deps:
+                lines.append(f"\t#select BR2_PACKAGE_<{dep}> FIXME: Replace by correct dependency\n")
+
+        lines.append('\thelp\n')
+
+        help_lines = textwrap.wrap(self.description, 62,
+                                   initial_indent='\t  ',
+                                   subsequent_indent='\t  ')
+
+        # make sure a help text is terminated with a full stop
+        if help_lines[-1][-1] != '.':
+            help_lines[-1] += '.'
+
+        # \t + two spaces is 3 char long
+        help_lines.append('')
+        if self.site_url:
+            help_lines.append('\t  ' + self.site_url)
+        if self.repo_url:
+            help_lines.append('\t  ' + self.repo_url)
+        if not self.site_url and not self.repo_url:
+            help_lines.append('\t  https://www.ros.org/')
+        help_lines = [x + '\n' for x in help_lines]
+        lines += help_lines
+
+        with open(path_to_config, 'w') as config_file:
+            config_file.writelines(lines)
+
+    def write_deps_and_xml(self, tmp_dir):
+        lines = []
+        pkg_deps = f'{self.buildroot_name}.deps'
+        path_to_deps = os.path.join(tmp_dir, pkg_deps)
+        lines.append(f"ROS build   : {', '.join(self.ros_build_dependencies)}\n")
+        lines.append(f"ROS run     : {', '.join(self.ros_run_dependencies)}\n\n")
+        lines.append(f"Other build : {', '.join(self.other_build_dependencies)}\n")
+        lines.append(f"Other run   : {', '.join(self.other_run_dependencies)}\n")
+        with open(path_to_deps, 'w') as deps_file:
+            deps_file.writelines(lines)
+        path_to_xml = os.path.join(tmp_dir, 'package.xml')
+        with open(path_to_xml, 'w') as xml_file:
+            xml_file.writelines(self.package_xml)
+
+
+def check_packages(rosdistro, packages):
+    for package in packages:
+        if not rosdistro.is_package(package):
+            logging.error(f'Error: {package} package is unknown !')
+            exit(1)
+
+
+def gen_pkg(rosdistro, pkgname, out_dir, tmp_dir, generated=None, dependencies=False):
+    if generated is None:
+        generated = set()
+    elif pkgname in generated:
+        return
+
+    generated.add(pkgname)
+
+    if not rosdistro.is_valid_package(pkgname):
+        logging.info(f'\n{pkgname} is not a valid package (virtual metapackage or without release)')
+        return
+
+    rospkg = rosdistro.get_ros_package(pkgname)
+
+    ros_deps = rospkg.ros_build_dependencies + rospkg.ros_run_dependencies
+    if dependencies and ros_deps:
+        for dep in ros_deps:
+            gen_pkg(rosdistro, dep, out_dir, tmp_dir, generated, dependencies)
+
+    pkg_dir = os.path.join(out_dir, rospkg.buildroot_name)
+    if not os.path.isdir(pkg_dir):
+        os.makedirs(pkg_dir)
+    pkg_tmp_dir = os.path.join(tmp_dir, rospkg.buildroot_name)
+    if not os.path.isdir(pkg_tmp_dir):
+        os.makedirs(pkg_tmp_dir)
+    rospkg.create_config_in(pkg_dir)
+    rospkg.create_package_mk(pkg_dir)
+    rospkg.create_hash_file(pkg_dir, pkg_tmp_dir)
+    rospkg.write_deps_and_xml(pkg_tmp_dir)
+
+
+def main():
+    handler = logging.StreamHandler()
+    handler.setFormatter(ColoredFormatter())
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
+
+    parser = argparse.ArgumentParser(description='Helper to import catkin package to buildroot.')
+    parser.add_argument('--list-packages', '-l', dest='list_packages', action='store_true',
+                        default=False, help='Lists all available packages.')
+    parser.add_argument('--list-packages-expand', '-L', dest='list_packages_expand', action='store_true',
+                        default=False, help='Lists all available packages and expand metapackages.')
+    parser.add_argument('--output-directory', '-o', dest='output_directory', action='store',
+                        default='./ros', help='Directory where packages are created. Default is ./ros')
+    parser.add_argument('--temp-directory', '-t', dest='temporary_directory', action='store',
+                        default='./ros-temp', help='Directory where packages downloaded. Default is ./ros-temp')
+    parser.add_argument('--package', '-p', dest='packages', action='append', nargs='*', required=False,
+                        help='Package(s) to generate.')
+    parser.add_argument('--dependencies', '-d', dest='dependencies', action='store_true',
+                        default=False, help='Generate all the dependencies for selected packages.')
+    parser.add_argument('--all', '-a', dest='all', action='store_true',
+                        default=False, help='Generate all packages.')
+    options = parser.parse_args()
+
+    distroname = 'noetic'
+    distroversion = 1
+    distrourl = f'https://raw.github.com/ros/rosdistro/master/{distroname}/distribution.yaml'
+    pythonversion = 3
+
+    request = requests.get(distrourl)
+    if request.status_code != 200:
+        logging.error(f'Error {request.status} downloading {distrourl}')
+        return
+    rosdistro = RosDistribution(distroname, distroversion, request.text, pythonversion)
+
+    if options.list_packages:
+        print(*rosdistro.packages(), sep='\n')
+        exit(0)
+
+    if options.list_packages_expand:
+        print(*rosdistro.packages(True), sep='\n')
+        exit(0)
+
+    packages = []
+    generated = None
+    gen_dep = False
+    if options.all:
+        packages = rosdistro.packages(True)
+    elif options.packages is not None:
+        generated = set()
+        gen_dep = options.dependencies
+        packages = list(OrderedDict.fromkeys([item for sublist in options.packages for item in sublist]))
+
+    if packages:
+        for package in packages:
+            gen_pkg(rosdistro, package, options.output_directory, options.temporary_directory, generated, gen_dep)
+
+        logging.info("\n")
+        logging.info("NOTE: Remember to also make an update to the DEVELOPERS file")
+        logging.info("      include an entry for the pkg in packages/Config.in and")
+        logging.info("      fix all FIXME into Config.in and <package>.mk file.")
+
+
+if __name__ == '__main__':
+    main()
