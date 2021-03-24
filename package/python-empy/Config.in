@@ -1,0 +1,6 @@
+config BR2_PACKAGE_PYTHON_EMPY
+	bool "python-empy"
+	help
+	  A templating system for Python.
+
+	  http://www.alcyone.com/software/empy
