@@ -1950,6 +1950,7 @@ N:	Nicolas Serafini <nicolas.serafini@ik.me>
 F:	package/catkin/
 F:	package/exiv2/
 F:	package/ofono/
+F:	package/pkg-catkin.mk
 F:	package/python-catkin-pkg/
 F:	package/python-empy/
 F:	utils/scanros
