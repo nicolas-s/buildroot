@@ -1947,6 +1947,7 @@ N:	Nicolas Cavallari <nicolas.cavallari@green-communications.fr>
 F:	package/libgit2/
 
 N:	Nicolas Serafini <nicolas.serafini@ik.me>
+F:	package/catkin/
 F:	package/exiv2/
 F:	package/ofono/
 F:	package/python-catkin-pkg/
